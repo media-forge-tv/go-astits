@@ -537,6 +537,9 @@ func writePSISection(w *astikit.BitsWriter, s *PSISection) (int, error) {
 	b := astikit.NewBitsWriterBatch(w)
 
 	sectionLength := calcPSISectionLength(s)
+	if sectionLength > 1021 {
+		return 0, fmt.Errorf("writePSISection: section length %d exceeds 1021 bytes", sectionLength)
+	}
 	sectionCRC32 := crc32Polynomial
 
 	if s.Header.TableID.hasCRC32() {

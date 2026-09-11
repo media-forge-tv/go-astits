@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 
 	"github.com/asticode/go-astikit"
@@ -332,7 +333,7 @@ func (m *Muxer) generatePAT() error {
 		Data: &PSISectionSyntaxData{PAT: d},
 		Header: &PSISectionSyntaxHeader{
 			CurrentNextIndicator: true,
-			// TODO support for PAT tables longer than 1 TS packet
+			// The section can span multiple TS packets.
 			//LastSectionNumber:    0,
 			//SectionNumber:        0,
 			TableIDExtension: d.TransportStreamID,
@@ -357,20 +358,7 @@ func (m *Muxer) generatePAT() error {
 		return err
 	}
 
-	m.patBytes.Reset()
-	wPacket := astikit.NewBitsWriter(astikit.BitsWriterOptions{Writer: &m.patBytes})
-
-	pkt := Packet{
-		Header: PacketHeader{
-			HasPayload:                true,
-			PayloadUnitStartIndicator: true,
-			PID:                       PIDPAT,
-			ContinuityCounter:         uint8(m.patCC.inc()),
-		},
-		Payload: m.buf.Bytes(),
-	}
-	if _, err := writePacket(wPacket, &pkt, m.packetSize); err != nil {
-		// FIXME save old PAT and rollback to it here maybe?
+	if err := m.packetizePSI(&m.patBytes, PIDPAT, &m.patCC); err != nil {
 		return err
 	}
 
@@ -400,7 +388,7 @@ func (m *Muxer) generatePMT() error {
 		Data: &PSISectionSyntaxData{PMT: &m.pmt},
 		Header: &PSISectionSyntaxHeader{
 			CurrentNextIndicator: true,
-			// TODO support for PMT tables longer than 1 TS packet
+			// The section can span multiple TS packets.
 			//LastSectionNumber:    0,
 			//SectionNumber:        0,
 			TableIDExtension: m.pmt.ProgramNumber,
@@ -425,24 +413,38 @@ func (m *Muxer) generatePMT() error {
 		return err
 	}
 
-	m.pmtBytes.Reset()
-	wPacket := astikit.NewBitsWriter(astikit.BitsWriterOptions{Writer: &m.pmtBytes})
-
-	pkt := Packet{
-		Header: PacketHeader{
-			HasPayload:                true,
-			PayloadUnitStartIndicator: true,
-			PID:                       pmtStartPID, // FIXME multiple programs support
-			ContinuityCounter:         uint8(m.pmtCC.inc()),
-		},
-		Payload: m.buf.Bytes(),
-	}
-	if _, err := writePacket(wPacket, &pkt, m.packetSize); err != nil {
-		// FIXME save old PMT and rollback to it here maybe?
+	if err := m.packetizePSI(&m.pmtBytes, pmtStartPID, &m.pmtCC); err != nil {
 		return err
 	}
 
 	m.pmtUpdated = false
 
+	return nil
+}
+
+// packetizePSI preserves the serialized section and its CRC. The pointer field
+// already in m.buf belongs only to the first packet; continuation packets have
+// no pointer field and increment the PID's continuity counter independently.
+func (m *Muxer) packetizePSI(dst *bytes.Buffer, pid uint16, cc *wrappingCounter) error {
+	if m.packetSize <= 4 {
+		return fmt.Errorf("astits: PSI packet size %d leaves no payload space", m.packetSize)
+	}
+	dst.Reset()
+	w := astikit.NewBitsWriter(astikit.BitsWriterOptions{Writer: dst})
+	data := m.buf.Bytes()
+	for offset := 0; offset < len(data); {
+		end := offset + m.packetSize - 4
+		if end > len(data) {
+			end = len(data)
+		}
+		pkt := Packet{
+			Header:  PacketHeader{HasPayload: true, PayloadUnitStartIndicator: offset == 0, PID: pid, ContinuityCounter: uint8(cc.inc())},
+			Payload: data[offset:end],
+		}
+		if _, err := writePacket(w, &pkt, m.packetSize); err != nil {
+			return err
+		}
+		offset = end
+	}
 	return nil
 }
