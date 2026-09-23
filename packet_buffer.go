@@ -11,11 +11,23 @@ import (
 
 // packetBuffer represents a packet buffer
 type packetBuffer struct {
-	packetSize       int
-	s                PacketSkipper
-	r                io.Reader
-	packetReadBuffer []byte
+	packetSize int
+	s          PacketSkipper
+	r          io.Reader
+
+	// Packets are read straight into slabs shared by packetSlabPackets
+	// packets, and their payloads are windows of it, so steady-state demuxing
+	// allocates twice per slab instead of a Packet plus a payload copy per
+	// packet. A slab region is never reused once handed out.
+	slab    []byte
+	packets []Packet
 }
+
+// packetSlabPackets is the number of packets sharing one slab: large enough to
+// amortise the two allocations to a fraction of a percent of the per-packet
+// work, small enough (~12 KiB for 188-byte packets) that a packet held back
+// in a slow PID's accumulator pins little memory.
+const packetSlabPackets = 64
 
 // newPacketBuffer creates a new packet buffer
 func newPacketBuffer(r io.Reader, packetSize int, s PacketSkipper) (pb *packetBuffer, err error) {
@@ -119,14 +131,18 @@ func rewind(r io.Reader) (n int64, err error) {
 
 // next fetches the next packet from the buffer
 func (pb *packetBuffer) next() (p *Packet, err error) {
-	// Read
-	if pb.packetReadBuffer == nil || len(pb.packetReadBuffer) != pb.packetSize {
-		pb.packetReadBuffer = make([]byte, pb.packetSize)
-	}
-
 	// Loop to make sure we return a packet even if first packets are skipped
 	for p == nil {
-		if _, err = io.ReadFull(pb.r, pb.packetReadBuffer); err != nil {
+		if len(pb.slab) < pb.packetSize {
+			pb.slab = make([]byte, packetSlabPackets*pb.packetSize)
+		}
+		if len(pb.packets) == 0 {
+			pb.packets = make([]Packet, packetSlabPackets)
+		}
+		buf := pb.slab[:pb.packetSize:pb.packetSize]
+
+		// Read
+		if _, err = io.ReadFull(pb.r, buf); err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
 				err = ErrNoMorePackets
 			} else {
@@ -136,11 +152,18 @@ func (pb *packetBuffer) next() (p *Packet, err error) {
 		}
 
 		// Parse packet
-		if p, err = parsePacket(astikit.NewBytesIterator(pb.packetReadBuffer), pb.s); err != nil {
-			if !errors.Is(err, errSkippedPacket) {
-				err = fmt.Errorf("astits: building packet failed: %w", err)
-				return
-			}
+		cand := &pb.packets[0]
+		*cand = Packet{}
+		parsed, perr := parsePacketInto(astikit.NewBytesIterator(buf), pb.s, cand, true)
+		if parsed {
+			// The packet may be retained, so its slab region and slot are spent
+			p = cand
+			pb.slab = pb.slab[pb.packetSize:]
+			pb.packets = pb.packets[1:]
+		}
+		if perr != nil && !errors.Is(perr, errSkippedPacket) {
+			err = fmt.Errorf("astits: building packet failed: %w", perr)
+			return
 		}
 	}
 
