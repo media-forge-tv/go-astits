@@ -76,8 +76,23 @@ type PacketAdaptationExtensionField struct {
 	SpliceType             uint8  // Indicates the parameters of the H.262 splice.
 }
 
-// parsePacket parses a packet
+// parsePacket parses a packet into a new Packet whose payload is a copy of the
+// iterator's bytes
 func parsePacket(i *astikit.BytesIterator, s PacketSkipper) (p *Packet, err error) {
+	p = &Packet{}
+	var parsed bool
+	if parsed, err = parsePacketInto(i, s, p, false); !parsed {
+		p = nil
+	}
+	return
+}
+
+// parsePacketInto parses a packet into p. With shareBuf the payload is a
+// capped window of the iterator's bytes instead of a copy, so the caller must
+// hand over bytes that are never written again. parsed reports whether p holds
+// a packet (possibly partial when err is set), as opposed to a sync or read
+// failure or a skipped packet.
+func parsePacketInto(i *astikit.BytesIterator, s PacketSkipper, p *Packet, shareBuf bool) (parsed bool, err error) {
 	// Get next byte
 	var b byte
 	if b, err = i.NextByte(); err != nil {
@@ -90,9 +105,7 @@ func parsePacket(i *astikit.BytesIterator, s PacketSkipper) (p *Packet, err erro
 		err = ErrPacketMustStartWithASyncByte
 		return
 	}
-
-	// Create packet
-	p = &Packet{}
+	parsed = true
 
 	// In case packet size is bigger than 188 bytes, we don't care for the first bytes
 	i.Seek(i.Len() - MpegTsPacketSize + 1)
@@ -114,13 +127,18 @@ func parsePacket(i *astikit.BytesIterator, s PacketSkipper) (p *Packet, err erro
 
 	// Skip packet
 	if s != nil && s(p) {
-		return nil, errSkippedPacket
+		return false, errSkippedPacket
 	}
 
 	// Build payload
 	if p.Header.HasPayload {
 		i.Seek(payloadOffset(offsetStart, p.Header, p.AdaptationField))
-		p.Payload = i.Dump()
+		if !shareBuf {
+			p.Payload = i.Dump()
+		} else if n := i.Len() - i.Offset(); n > 0 {
+			bs, _ := i.NextBytesNoCopy(n)
+			p.Payload = bs[:n:n]
+		}
 	}
 	return
 }
