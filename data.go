@@ -185,10 +185,34 @@ func isPSIComplete(ps []*Packet) bool {
 
 // isPESComplete checks whether payload fully contains PES packet
 func isPESComplete(ps []*Packet) bool {
+	// PES_packet_length sits in bytes 4-5 of the PES payload. Read it without
+	// merging the packets: when it is 0 (unbounded video PES) completion is only
+	// known at the next PUSI, and when it is set the PES cannot be complete until
+	// 6+length bytes have accumulated. Merging and parsing the header on every
+	// packet made accumulation quadratic in the PES size.
+	var lb [6]byte
+	var n int
+	for _, p := range ps {
+		n += copy(lb[n:], p.Payload)
+		if n == len(lb) {
+			break
+		}
+	}
+	if n < len(lb) {
+		return false
+	}
+	pl := int(lb[4])<<8 | int(lb[5])
+	if pl == 0 {
+		return false
+	}
+
 	// Get payload length
 	var l int
 	for _, p := range ps {
 		l += len(p.Payload)
+	}
+	if l < len(lb)+pl {
+		return false
 	}
 
 	// Get the slice for payload from pool
